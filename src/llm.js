@@ -110,7 +110,8 @@ export async function callLLM(model, systemPrompt, userPrompt, options = {}) {
 
     try {
       const controller = new AbortController();
-      const timeout = setTimeout(() => controller.abort(), 120_000); // 2 min timeout
+      const timeoutMs = options.timeout || 240_000; // 4 min default timeout
+      const timeout = setTimeout(() => controller.abort(), timeoutMs);
 
       const response = await fetch(GATEWAY_URL, {
         method: 'POST',
