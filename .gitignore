@@ -1,0 +1,14 @@
+node_modules/
+dist/
+build/
+out/
+
+.env
+.env.*
+
+plan.md
+build-plan.md
+todo.md
+
+# Build outputs — each run creates a timestamped folder with LLM logs, cached docs, etc.
+builds/

@@ -1,0 +1,12 @@
+{
+  "name": "builder-agent",
+  "version": "0.1.0",
+  "type": "module",
+  "scripts": {
+    "start": "node run.js"
+  },
+  "dependencies": {
+    "commander": "^13.0.0",
+    "dotenv": "^16.4.0"
+  }
+}
