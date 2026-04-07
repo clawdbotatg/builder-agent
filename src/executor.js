@@ -362,12 +362,14 @@ async function executeCodeStep(step, buildState, systemPrompt, userPrompt) {
   // Parse code blocks and file paths from the response
   const files = extractFilesFromResponse(response, step, buildState);
 
-  // Write files to disk (with safeguards for critical scaffold files)
+  // Write files to disk (with safeguards for infrastructure scaffold files)
   const PROTECTED_FILES = [
-    'foundry.toml', 'Deploy.s.sol', 'DeployHelpers.s.sol', 'VerifyAll.s.sol',
+    'foundry.toml', 'DeployHelpers.s.sol', 'VerifyAll.s.sol',
     'scaffold.config.ts', 'package.json', 'tsconfig.json', 'next.config.ts',
+    'layout.tsx', // app/layout.tsx is the root layout — don't overwrite
   ];
 
+  const writtenBasenames = [];
   for (const file of files) {
     const fullPath = resolveFilePath(file.path, buildState);
     if (!fullPath) continue;
@@ -381,6 +383,12 @@ async function executeCodeStep(step, buildState, systemPrompt, userPrompt) {
     fs.mkdirSync(path.dirname(fullPath), { recursive: true });
     fs.writeFileSync(fullPath, file.content, 'utf-8');
     log(`  Wrote: ${file.path}`);
+    writtenBasenames.push(basename);
+  }
+
+  // Clean up default scaffold files that our new files replace
+  if (buildState.projectPath) {
+    cleanupDefaultScaffoldFiles(buildState.projectPath, writtenBasenames, step);
   }
 
   const writtenFiles = files.map(f => f.path);
@@ -431,6 +439,37 @@ async function executeGenericStep(step, buildState, systemPrompt, userPrompt) {
   );
 
   return { output: response, files: [] };
+}
+
+// --- Scaffold cleanup ---
+
+function cleanupDefaultScaffoldFiles(projectPath, writtenBasenames, step) {
+  // If we wrote a new contract, remove the default YourContract.sol
+  if (step.name.includes('contract') && !step.name.includes('test')) {
+    const defaultContract = path.join(projectPath, 'packages/foundry/contracts/YourContract.sol');
+    if (fs.existsSync(defaultContract) && writtenBasenames.some(b => b.endsWith('.sol') && b !== 'YourContract.sol')) {
+      fs.unlinkSync(defaultContract);
+      log(`  🧹 Removed default YourContract.sol`);
+    }
+  }
+
+  // If we wrote a new deploy script, remove the default DeployYourContract.s.sol
+  if (step.name.includes('deploy') && !step.name.includes('deploy-to')) {
+    const defaultDeploy = path.join(projectPath, 'packages/foundry/script/DeployYourContract.s.sol');
+    if (fs.existsSync(defaultDeploy) && writtenBasenames.some(b => b.endsWith('.s.sol') && b !== 'DeployYourContract.s.sol')) {
+      fs.unlinkSync(defaultDeploy);
+      log(`  🧹 Removed default DeployYourContract.s.sol`);
+    }
+  }
+
+  // If we wrote new tests, remove the default YourContract.t.sol
+  if (step.name.includes('test')) {
+    const defaultTest = path.join(projectPath, 'packages/foundry/test/YourContract.t.sol');
+    if (fs.existsSync(defaultTest) && writtenBasenames.some(b => b.endsWith('.t.sol') && b !== 'YourContract.t.sol')) {
+      fs.unlinkSync(defaultTest);
+      log(`  🧹 Removed default YourContract.t.sol`);
+    }
+  }
 }
 
 // --- File extraction ---
@@ -492,15 +531,26 @@ function resolveFilePath(filePath, buildState) {
     return path.join(buildState.projectPath, filePath);
   }
 
+  // App Router paths: app/page.tsx, app/signer/[address]/page.tsx
+  if (filePath.startsWith('app/')) {
+    return path.join(buildState.projectPath, 'packages/nextjs', filePath);
+  }
+
+  // Components path: components/GuestbookEntry.tsx
+  if (filePath.startsWith('components/')) {
+    return path.join(buildState.projectPath, 'packages/nextjs', filePath);
+  }
+
   // If it's just a filename, try to place it intelligently
   if (filePath.endsWith('.sol') && !filePath.includes('/')) {
+    // .t.sol → test, .s.sol → script, else → contracts
+    if (filePath.endsWith('.t.sol')) {
+      return path.join(buildState.projectPath, 'packages/foundry/test', filePath);
+    }
+    if (filePath.endsWith('.s.sol')) {
+      return path.join(buildState.projectPath, 'packages/foundry/script', filePath);
+    }
     return path.join(buildState.projectPath, 'packages/foundry/contracts', filePath);
-  }
-  if (filePath.endsWith('.t.sol')) {
-    return path.join(buildState.projectPath, 'packages/foundry/test', filePath);
-  }
-  if (filePath.endsWith('.s.sol')) {
-    return path.join(buildState.projectPath, 'packages/foundry/script', filePath);
   }
   if (filePath.endsWith('.tsx') || filePath.endsWith('.ts')) {
     return path.join(buildState.projectPath, 'packages/nextjs', filePath);

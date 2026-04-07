@@ -86,6 +86,8 @@ const FOCUS_RULES = {
 - SE2 built-in components: <Address/>, <AddressInput/>, <Balance/>, <EtherInput/>`,
 
   'solidity': `
+- EDIT IN PLACE: Replace content of packages/foundry/contracts/YourContract.sol with your new contract
+  OR create a new .sol file and DELETE YourContract.sol — do NOT leave unused scaffold files
 - Follow Checks-Effects-Interactions pattern for ALL functions
 - Emit events for EVERY state change
 - Use OpenZeppelin base contracts when applicable
@@ -94,27 +96,26 @@ const FOCUS_RULES = {
 - Use calldata for string/bytes parameters in external functions
 - Solidity ^0.8.20 for built-in overflow protection
 - NEVER use tx.origin for authentication
-- Paginate array reads — never return unbounded arrays
-- Test edge cases: zero, max uint, empty strings, out-of-bounds`,
+- Paginate array reads — never return unbounded arrays`,
 
   'deploy-script': `
-- Create in packages/foundry/script/
-- snake_case filename (e.g., deploy_guestbook.s.sol)
-- Follow SE2 deploy pattern:
-  import "forge-std/Script.sol";
-  import "../contracts/YourContract.sol";
-  contract DeployYourContract is Script {
-    function run() external {
-      vm.startBroadcast();
-      new YourContract();
-      vm.stopBroadcast();
+- EDIT IN PLACE: Replace packages/foundry/script/DeployYourContract.s.sol with your deploy script
+- MUST use ScaffoldETHDeploy base class and ScaffoldEthDeployerRunner modifier (from DeployHelpers.s.sol)
+- Pattern:
+  import "./DeployHelpers.s.sol";
+  import "../contracts/GuestBook.sol";
+  contract DeployGuestBook is ScaffoldETHDeploy {
+    function run() external ScaffoldEthDeployerRunner {
+      new GuestBook();
     }
   }
-- Run with: yarn deploy --file DeployYourContract.s.sol
-- yarn deploy auto-generates deployedContracts.ts — NEVER edit that file`,
+- ALSO update Deploy.s.sol to import and call your new deploy script instead of DeployYourContract
+- yarn deploy auto-generates deployedContracts.ts — NEVER edit that file
+- The deployer variable comes from ScaffoldETHDeploy — use it if your contract needs an owner`,
 
   'testing': `
-- Tests go in packages/foundry/test/
+- EDIT IN PLACE: Replace packages/foundry/test/YourContract.t.sol with your test file
+  OR create a new test file and DELETE YourContract.t.sol
 - Use forge-std/Test.sol base
 - Test every function in the contract
 - Test edge cases: empty input, max length, zero index, out of bounds
@@ -126,19 +127,23 @@ const FOCUS_RULES = {
 - Run with: forge test`,
 
   'frontend': `
+- CRITICAL: SE2 uses Next.js APP ROUTER, not Pages Router
+- Pages go in packages/nextjs/app/ — e.g. app/page.tsx (home), app/signer/[address]/page.tsx
+- EDIT IN PLACE: Replace content of app/page.tsx for the home page — do NOT create pages/index.tsx
+- Add "use client" directive at top of every page/component that uses hooks
 - Use scaffold hooks DIRECTLY in components — NO wrapper hooks
-- useScaffoldReadContract({ contractName, functionName, args, watch })
-- const { writeContractAsync, isMining } = useScaffoldWriteContract("ContractName")
+- useScaffoldReadContract({ contractName: "GuestBook", functionName: "getEntries", args: [...] })
+- const { writeContractAsync, isPending } = useScaffoldWriteContract({ contractName: "GuestBook" })
 - useScaffoldEventHistory({ contractName, eventName, fromBlock, watch })
-- Use SE2 built-in components: <Address address={addr}/> for all addresses
+- Import UI components from @scaffold-ui/components: Address, AddressInput, Balance, EtherInput
+  Example: import { Address } from "@scaffold-ui/components";
 - Use notification from ~~/utils/scaffold-eth for success/error feedback
-- Use DaisyUI component classes for styling
+- Use DaisyUI component classes for styling (btn, card, modal, etc.)
 - Every action button needs its own loading + disabled state
-- Three-button flow: Switch Network → Approve → Execute (one at a time)
-- RainbowKit handles wallet connection and network switching automatically
-- Do NOT build custom NetworkGuard or wallet connect components
-- Pages use NextPage type: const Page: NextPage = () => {...}; export default Page;
-- Use ~~ path alias for all imports`,
+- RainbowKit handles wallet connection and network switching — do NOT build custom wallet/network components
+- Pages use NextPage type: import type { NextPage } from "next";
+- Use ~~ path alias for all imports within nextjs package
+- Put reusable components in packages/nextjs/components/ (NOT app/_components/)`,
 
   'deploy-command': `
 - Phase 2: yarn deploy --network base
@@ -266,7 +271,7 @@ function gatherProjectFiles(step, projectPath, completedSteps) {
   const contractsDir = path.join(projectPath, 'packages/foundry/contracts');
   if (fs.existsSync(contractsDir)) {
     try {
-      const solFiles = fs.readdirSync(contractsDir).filter(f => f.endsWith('.sol'));
+      const solFiles = fs.readdirSync(contractsDir).filter(f => f.endsWith('.sol') && f !== 'YourContract.sol');
       for (const f of solFiles) {
         const content = fs.readFileSync(path.join(contractsDir, f), 'utf-8');
         files.push(`### ${f}\n\`\`\`solidity\n${content}\n\`\`\``);
@@ -274,23 +279,48 @@ function gatherProjectFiles(step, projectPath, completedSteps) {
     } catch (e) { /* skip */ }
   }
 
+  // Include Deploy.s.sol and DeployHelpers.s.sol when writing deploy scripts
+  if (step.name.includes('deploy') && !step.name.includes('deploy-to')) {
+    for (const scriptFile of ['Deploy.s.sol', 'DeployHelpers.s.sol']) {
+      const scriptPath = path.join(projectPath, 'packages/foundry/script', scriptFile);
+      if (fs.existsSync(scriptPath)) {
+        try {
+          const content = fs.readFileSync(scriptPath, 'utf-8');
+          files.push(`### ${scriptFile} (EXISTING — you must update Deploy.s.sol to reference your contract)\n\`\`\`solidity\n${content}\n\`\`\``);
+        } catch (e) { /* skip */ }
+      }
+    }
+  }
+
   // Include deployedContracts.ts if frontend step
-  if (step.name.includes('build-') || step.name.includes('page')) {
+  if (step.name.includes('build-') || step.name.includes('page') || step.name.includes('styling')) {
     const deployed = path.join(projectPath, 'packages/nextjs/contracts/deployedContracts.ts');
     if (fs.existsSync(deployed)) {
       try {
         const content = fs.readFileSync(deployed, 'utf-8');
-        files.push(`### deployedContracts.ts (AUTO-GENERATED — shows ABI)\n\`\`\`typescript\n${content}\n\`\`\``);
+        files.push(`### deployedContracts.ts (AUTO-GENERATED — shows ABI, do NOT edit)\n\`\`\`typescript\n${content}\n\`\`\``);
       } catch (e) { /* skip */ }
     }
   }
 
-  // Include existing components if building a page
-  if (step.name.includes('page')) {
+  // Include existing app/page.tsx and components for frontend steps
+  if (step.name.includes('build-') || step.name.includes('page') || step.name.includes('styling')) {
+    // Current home page (to edit in place)
+    const homePage = path.join(projectPath, 'packages/nextjs/app/page.tsx');
+    if (fs.existsSync(homePage)) {
+      try {
+        const content = fs.readFileSync(homePage, 'utf-8');
+        files.push(`### app/page.tsx (CURRENT — edit this file for the home page)\n\`\`\`tsx\n${content}\n\`\`\``);
+      } catch (e) { /* skip */ }
+    }
+
+    // Existing custom components
     const componentsDir = path.join(projectPath, 'packages/nextjs/components');
     if (fs.existsSync(componentsDir)) {
       try {
-        const tsxFiles = fs.readdirSync(componentsDir).filter(f => f.endsWith('.tsx'));
+        const tsxFiles = fs.readdirSync(componentsDir).filter(f =>
+          f.endsWith('.tsx') && !['Header.tsx', 'Footer.tsx', 'SwitchTheme.tsx', 'ThemeProvider.tsx', 'ScaffoldEthAppWithProviders.tsx'].includes(f)
+        );
         for (const f of tsxFiles) {
           const content = fs.readFileSync(path.join(componentsDir, f), 'utf-8');
           files.push(`### components/${f}\n\`\`\`tsx\n${content}\n\`\`\``);
