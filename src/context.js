@@ -99,19 +99,37 @@ const FOCUS_RULES = {
 - Paginate array reads — never return unbounded arrays`,
 
   'deploy-script': `
-- EDIT IN PLACE: Replace packages/foundry/script/DeployYourContract.s.sol with your deploy script
-- MUST use ScaffoldETHDeploy base class and ScaffoldEthDeployerRunner modifier (from DeployHelpers.s.sol)
-- Pattern:
+- MUST output TWO files: DeployGuestBook.s.sol AND Deploy.s.sol
+- MUST use ScaffoldETHDeploy base class and ScaffoldEthDeployerRunner modifier from DeployHelpers.s.sol
+- Use RELATIVE import paths: "../contracts/GuestBook.sol" and "./DeployHelpers.s.sol"
+- The deployer variable and deployments array come from ScaffoldETHDeploy base class
+- Do NOT use console.log — it requires a separate import and is not needed
+- yarn deploy auto-generates deployedContracts.ts — NEVER edit that file
+
+EXACT DeployGuestBook.s.sol (copy VERBATIM — do NOT add console.log, do NOT use named imports):
+  // SPDX-License-Identifier: MIT
+  pragma solidity ^0.8.19;
   import "./DeployHelpers.s.sol";
   import "../contracts/GuestBook.sol";
   contract DeployGuestBook is ScaffoldETHDeploy {
     function run() external ScaffoldEthDeployerRunner {
-      new GuestBook();
+      GuestBook guestBook = new GuestBook();
+      deployments.push(Deployment("GuestBook", address(guestBook)));
     }
   }
-- ALSO update Deploy.s.sol to import and call your new deploy script instead of DeployYourContract
-- yarn deploy auto-generates deployedContracts.ts — NEVER edit that file
-- The deployer variable comes from ScaffoldETHDeploy — use it if your contract needs an owner`,
+IMPORTANT: Use "import ./DeployHelpers.s.sol" (file import, NOT named import). Deployment struct and deployments array are inherited from ScaffoldETHDeploy.
+
+EXACT Deploy.s.sol pattern (copy this structure):
+  // SPDX-License-Identifier: MIT
+  pragma solidity ^0.8.19;
+  import "./DeployHelpers.s.sol";
+  import { DeployGuestBook } from "./DeployGuestBook.s.sol";
+  contract DeployScript is ScaffoldETHDeploy {
+    function run() external {
+      DeployGuestBook deployGuestBook = new DeployGuestBook();
+      deployGuestBook.run();
+    }
+  }`,
 
   'testing': `
 - EDIT IN PLACE: Replace packages/foundry/test/YourContract.t.sol with your test file
