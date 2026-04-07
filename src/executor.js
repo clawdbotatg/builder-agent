@@ -30,73 +30,91 @@ export async function executeSteps(steps, buildPath, job, skills) {
     const stepDir = path.join(logsDir, `step-${String(step.step).padStart(2, '0')}-${step.name}`);
     fs.mkdirSync(stepDir, { recursive: true });
 
-    try {
-      // 1. CONTEXT — minimax prepares the prompt
-      log(`  Preparing context...`);
-      const { systemPrompt, userPrompt } = await prepareStepContext(step, buildState);
+    const maxRetries = isCodeStep(step) ? 1 : 0; // Retry code steps once
+    let lastError = null;
 
-      writeFile(path.join(stepDir, 'system-prompt.md'), systemPrompt);
-      writeFile(path.join(stepDir, 'user-prompt.md'), userPrompt);
+    for (let attempt = 0; attempt <= maxRetries; attempt++) {
+      try {
+        if (attempt > 0) {
+          log(`  ↻ Retry ${attempt}/${maxRetries}...`);
+        }
 
-      // 2. EXECUTE — call the target model or run commands
-      let result;
+        // 1. CONTEXT — minimax prepares the prompt
+        log(`  Preparing context...`);
+        const { systemPrompt, userPrompt } = await prepareStepContext(step, buildState);
 
-      if (step.name === 'read-agents-md' || step.name === 'read-agents') {
-        // Special step: read AGENTS.md and store in build state
-        result = await executeReadAgentsStep(step, buildState);
-      } else if (isCommandStep(step)) {
-        // Shell command steps — extract and run the command
-        result = await executeCommandStep(step, buildState, systemPrompt, userPrompt);
-      } else if (step.gate) {
-        // Validation gate — evaluate current state
-        result = await executeGateStep(step, buildState, systemPrompt, userPrompt);
-      } else if (isCodeStep(step)) {
-        // Code generation steps — call LLM and write files
-        result = await executeCodeStep(step, buildState, systemPrompt, userPrompt);
-      } else {
-        // Generic step — call LLM for guidance/output
-        result = await executeGenericStep(step, buildState, systemPrompt, userPrompt);
-      }
+        writeFile(path.join(stepDir, `system-prompt${attempt > 0 ? `-retry${attempt}` : ''}.md`), systemPrompt);
+        writeFile(path.join(stepDir, `user-prompt${attempt > 0 ? `-retry${attempt}` : ''}.md`), userPrompt);
 
-      writeFile(path.join(stepDir, 'result.md'), result.output || 'No output');
-      if (result.files) {
-        writeFile(path.join(stepDir, 'files-written.json'), JSON.stringify(result.files, null, 2));
-      }
+        // On retry, append the error from the previous attempt to help the LLM fix it
+        let retryContext = '';
+        if (attempt > 0 && lastError) {
+          retryContext = `\n\n⚠️ PREVIOUS ATTEMPT FAILED: ${lastError}\nFix the issue and try again. Make sure to output COMPLETE file contents.`;
+        }
 
-      // 3. EVALUATE — check if step succeeded
-      log(`  Evaluating...`);
-      const evaluation = await evaluateStep(step, result, buildState);
-      writeFile(path.join(stepDir, 'evaluation.md'), evaluation.summary);
+        // 2. EXECUTE — call the target model or run commands
+        let result;
 
-      // 4. UPDATE STATE — always update state (e.g., set projectPath after scaffold)
-      // even if evaluation fails, so subsequent steps can reference the project
-      updateBuildState(step, result, buildState);
+        if (step.name === 'read-agents-md' || step.name === 'read-agents') {
+          result = await executeReadAgentsStep(step, buildState);
+        } else if (isCommandStep(step)) {
+          result = await executeCommandStep(step, buildState, systemPrompt, userPrompt);
+        } else if (step.gate) {
+          result = await executeGateStep(step, buildState, systemPrompt, userPrompt);
+        } else if (isCodeStep(step)) {
+          result = await executeCodeStep(step, buildState, systemPrompt, userPrompt + retryContext);
+        } else {
+          result = await executeGenericStep(step, buildState, systemPrompt, userPrompt);
+        }
 
-      if (!evaluation.passed) {
-        log(`  ✗ FAILED: ${evaluation.reason}`);
-        writeFile(path.join(stepDir, 'FAILED.md'), evaluation.reason);
-        // For now, log and continue. Later: retry logic.
+        writeFile(path.join(stepDir, `result${attempt > 0 ? `-retry${attempt}` : ''}.md`), result.output || 'No output');
+        if (result.files) {
+          writeFile(path.join(stepDir, 'files-written.json'), JSON.stringify(result.files, null, 2));
+        }
+
+        // 3. EVALUATE — check if step succeeded
+        log(`  Evaluating...`);
+        const evaluation = await evaluateStep(step, result, buildState);
+        writeFile(path.join(stepDir, `evaluation${attempt > 0 ? `-retry${attempt}` : ''}.md`), evaluation.summary);
+
+        // 4. UPDATE STATE — always update state
+        updateBuildState(step, result, buildState);
+
+        if (!evaluation.passed) {
+          lastError = evaluation.reason;
+          if (attempt < maxRetries) {
+            log(`  ✗ FAILED (will retry): ${evaluation.reason}`);
+            continue; // retry
+          }
+          log(`  ✗ FAILED: ${evaluation.reason}`);
+          writeFile(path.join(stepDir, 'FAILED.md'), evaluation.reason);
+          buildState.completedSteps.push({
+            ...step,
+            result: `FAILED: ${evaluation.reason}`,
+          });
+          break;
+        }
+
+        log(`  ✓ PASSED`);
         buildState.completedSteps.push({
           ...step,
-          result: `FAILED: ${evaluation.reason}`,
+          result: 'done',
         });
-        continue;
+        break; // success, stop retrying
+
+      } catch (err) {
+        lastError = err.message;
+        if (attempt < maxRetries) {
+          log(`  ✗ ERROR (will retry): ${err.message}`);
+          continue;
+        }
+        log(`  ✗ ERROR: ${err.message}`);
+        writeFile(path.join(stepDir, 'ERROR.md'), err.stack || err.message);
+        buildState.completedSteps.push({
+          ...step,
+          result: `ERROR: ${err.message}`,
+        });
       }
-
-      log(`  ✓ PASSED`);
-
-      buildState.completedSteps.push({
-        ...step,
-        result: 'done',
-      });
-
-    } catch (err) {
-      log(`  ✗ ERROR: ${err.message}`);
-      writeFile(path.join(stepDir, 'ERROR.md'), err.stack || err.message);
-      buildState.completedSteps.push({
-        ...step,
-        result: `ERROR: ${err.message}`,
-      });
     }
   }
 
@@ -365,7 +383,31 @@ async function executeCodeStep(step, buildState, systemPrompt, userPrompt) {
     log(`  Wrote: ${file.path}`);
   }
 
-  return { output: response, files: files.map(f => f.path) };
+  const writtenFiles = files.map(f => f.path);
+
+  // If we wrote Solidity files, verify compilation immediately
+  if (buildState.projectPath && writtenFiles.some(f => f.endsWith('.sol'))) {
+    try {
+      const compileOutput = execSync(`forge build --root packages/foundry`, {
+        cwd: buildState.projectPath,
+        encoding: 'utf-8',
+        timeout: 30_000,
+        stdio: ['pipe', 'pipe', 'pipe'],
+        env: { ...process.env, FORCE_COLOR: '0' },
+      });
+      log(`  Compilation check: ✓`);
+    } catch (err) {
+      const stderr = (err.stderr || '').slice(-500);
+      log(`  Compilation check: ✗`);
+      return {
+        output: `Code written but FAILED compilation:\n${stderr}`,
+        exitCode: 1,
+        files: writtenFiles,
+      };
+    }
+  }
+
+  return { output: response, files: writtenFiles };
 }
 
 async function executeGateStep(step, buildState, systemPrompt, userPrompt) {
