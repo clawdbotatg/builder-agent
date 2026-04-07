@@ -100,6 +100,16 @@ export async function executeSteps(steps, buildPath, job, skills) {
     }
   }
 
+  // Clean up background processes
+  if (buildState.forkProcess) {
+    log(`\nStopping fork process...`);
+    try {
+      process.kill(-buildState.forkProcess.pid, 'SIGTERM');
+    } catch (e) {
+      // Process may already be dead
+    }
+  }
+
   return buildState;
 }
 
@@ -155,12 +165,12 @@ async function executeCommandStep(step, buildState, systemPrompt, userPrompt) {
       `What shell command should I run for this step?\n\nStep: ${step.name}\nDescription: ${step.description}\nProject path: ${buildState.projectPath || 'not yet created'}\n\n${userPrompt}`,
       { maxTokens: 256, label: `cmd-${step.name}` }
     );
-    return runCommand(response.trim(), buildState);
+    return await runCommand(response.trim(), buildState);
   }
 
   // Longer timeout for scaffold/install
   const timeout = (step.name.includes('scaffold') || step.name.includes('install')) ? 300_000 : 120_000;
-  return runCommand(command, buildState, { timeout });
+  return await runCommand(command, buildState, { timeout });
 }
 
 function extractCommand(step, buildState) {
@@ -182,10 +192,7 @@ function extractCommand(step, buildState) {
     return `cd "${buildState.buildPath}" && echo "${projectName}" | npx -y create-eth@latest -s foundry`;
   }
   if (name === 'deploy-to-local-fork') {
-    // Extract deploy file from step description if specified
-    const fileMatch = step.description && step.description.match(/--file\s+(\S+)/);
-    const fileArg = fileMatch ? ` --file ${fileMatch[1]}` : '';
-    return projectDir ? `cd "${projectDir}" && yarn deploy${fileArg}` : null;
+    return projectDir ? `cd "${projectDir}" && LOCALHOST_KEYSTORE_ACCOUNT=scaffold-eth-default yarn deploy` : null;
   }
   if (name === 'deploy-to-base' || name === 'deploy-to-live') {
     return projectDir ? `cd "${projectDir}" && yarn deploy --network base` : null;
@@ -224,15 +231,13 @@ function runCommand(command, buildState, options = {}) {
   log(`  Running: ${command.length > 100 ? command.slice(0, 100) + '...' : command}`);
   const timeout = options.timeout || 120_000;
 
-  // For long-running commands like fork, we'd need background execution.
-  // For now, skip background commands and just note them.
-  if (command.includes('yarn fork') || command.includes('yarn start')) {
-    log(`  ⚠ Background command — noting for manual execution`);
-    return {
-      output: `Background command (run manually): ${command}`,
-      exitCode: 0,
-      files: [],
-    };
+  // Background processes (fork, dev server) — spawn detached and wait for readiness
+  if (command.includes('yarn fork')) {
+    return spawnForkProcess(command, buildState);
+  }
+  if (command.includes('yarn start')) {
+    log(`  ⚠ Skipping dev server — use yarn next:build to verify instead`);
+    return { output: 'Dev server skipped (not needed for automated build)', exitCode: 0, files: [] };
   }
 
   try {
@@ -256,12 +261,79 @@ function runCommand(command, buildState, options = {}) {
   }
 }
 
+function spawnForkProcess(command, buildState) {
+  const projectDir = buildState.projectPath;
+  if (!projectDir) {
+    return { output: 'FAILED: projectPath not set', exitCode: 1, files: [] };
+  }
+
+  log(`  Spawning fork process in background...`);
+
+  // Extract the actual command parts
+  const forkProc = spawn('yarn', ['fork', '--network', 'base'], {
+    cwd: projectDir,
+    stdio: ['ignore', 'pipe', 'pipe'],
+    detached: true,
+    env: { ...process.env, FORCE_COLOR: '0' },
+  });
+
+  // Store the process so we can kill it later
+  buildState.forkProcess = forkProc;
+
+  // Wait up to 15 seconds for the fork to be ready (listening on port 8545)
+  return new Promise((resolve) => {
+    let output = '';
+    let resolved = false;
+
+    const done = (exitCode) => {
+      if (resolved) return;
+      resolved = true;
+      resolve({ output: output.slice(-2000), exitCode, files: [] });
+    };
+
+    forkProc.stdout.on('data', (data) => {
+      output += data.toString();
+      // Anvil prints "Listening on 127.0.0.1:8545" when ready
+      if (output.includes('Listening on')) {
+        log(`  Fork ready (listening on 8545)`);
+        forkProc.unref(); // Allow parent to exit without killing fork
+        done(0);
+      }
+    });
+
+    forkProc.stderr.on('data', (data) => {
+      output += data.toString();
+    });
+
+    forkProc.on('error', (err) => {
+      log(`  Fork process error: ${err.message}`);
+      done(1);
+    });
+
+    forkProc.on('exit', (code) => {
+      if (!resolved) {
+        log(`  Fork process exited with code ${code}`);
+        done(code || 1);
+      }
+    });
+
+    // Timeout after 30 seconds
+    setTimeout(() => {
+      if (!resolved) {
+        log(`  Fork startup timed out (30s) — continuing anyway`);
+        forkProc.unref();
+        done(0); // Don't fail — fork might still be starting
+      }
+    }, 30_000);
+  });
+}
+
 async function executeCodeStep(step, buildState, systemPrompt, userPrompt) {
   // Call the target model to generate code
   const maxTokens = step.model === 'opus' ? 8192 : step.model === 'sonnet' ? 8192 : 2048;
 
   // Append output format instruction to user prompt
-  const formatInstruction = `\n\nIMPORTANT: For each file you produce, use this exact format:\n\nFILE: path/to/file.ext\n\`\`\`lang\n<file content>\n\`\`\`\n\nUse the full relative path (e.g., packages/foundry/contracts/GuestBook.sol).`;
+  const formatInstruction = `\n\nIMPORTANT OUTPUT FORMAT: You must output the COMPLETE file content. Do NOT describe what you would do — actually write the code. Do NOT use tool calls or placeholder comments. For each file, use this exact format:\n\nFILE: path/to/file.ext\n\`\`\`lang\n<complete file content here>\n\`\`\`\n\nUse the full relative path (e.g., packages/foundry/contracts/GuestBook.sol).`;
 
   const response = await callLLM(step.model,
     systemPrompt,
@@ -272,14 +344,25 @@ async function executeCodeStep(step, buildState, systemPrompt, userPrompt) {
   // Parse code blocks and file paths from the response
   const files = extractFilesFromResponse(response, step, buildState);
 
-  // Write files to disk
+  // Write files to disk (with safeguards for critical scaffold files)
+  const PROTECTED_FILES = [
+    'foundry.toml', 'Deploy.s.sol', 'DeployHelpers.s.sol', 'VerifyAll.s.sol',
+    'scaffold.config.ts', 'package.json', 'tsconfig.json', 'next.config.ts',
+  ];
+
   for (const file of files) {
     const fullPath = resolveFilePath(file.path, buildState);
-    if (fullPath) {
-      fs.mkdirSync(path.dirname(fullPath), { recursive: true });
-      fs.writeFileSync(fullPath, file.content, 'utf-8');
-      log(`  Wrote: ${file.path}`);
+    if (!fullPath) continue;
+
+    const basename = path.basename(file.path);
+    if (PROTECTED_FILES.includes(basename) && fs.existsSync(fullPath)) {
+      log(`  ⚠ Skipping protected file: ${file.path} (already exists from scaffold)`);
+      continue;
     }
+
+    fs.mkdirSync(path.dirname(fullPath), { recursive: true });
+    fs.writeFileSync(fullPath, file.content, 'utf-8');
+    log(`  Wrote: ${file.path}`);
   }
 
   return { output: response, files: files.map(f => f.path) };
@@ -342,7 +425,7 @@ function extractFilesFromResponse(response, step, buildState) {
   // Strategy 4: If step has specific outputs, match code blocks to outputs in order
   if (step.outputs && step.outputs.length > 0) {
     const codeBlocks = [];
-    const blockRegex = /```(?:solidity|typescript|tsx|javascript|js|ts|cjs)\n([\s\S]*?)```/g;
+    const blockRegex = /```(?:solidity|typescript|tsx|javascript|js|ts|cjs|lang)\n([\s\S]*?)(?:```|$)/g;
     while ((match = blockRegex.exec(response)) !== null) {
       codeBlocks.push(match[1].trim());
     }
